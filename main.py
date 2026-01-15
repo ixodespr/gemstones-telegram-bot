@@ -1,70 +1,76 @@
 import os
 import json
+import logging
 
 import gspread
 from google.oauth2.service_account import Credentials
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
+# -------------------------
+# ЛОГИ
+# -------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
-# ---------- CONFIG ----------
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-
+# -------------------------
+# ENV ПЕРЕМЕННЫЕ (Render)
+# -------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # может не использоваться
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("TELEGRAM_TOKEN not set")
 
 if not SPREADSHEET_ID:
-    raise ValueError("SPREADSHEET_ID is not set")
+    raise RuntimeError("SPREADSHEET_ID not set")
 
 if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
 
-
-# ---------- GOOGLE SHEETS ----------
+# -------------------------
+# GOOGLE SHEETS
+# -------------------------
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 
 creds = Credentials.from_service_account_info(
     service_account_info,
-    scopes=SCOPES
+    scopes=SCOPES,
 )
 
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
-
-# ---------- TELEGRAM HANDLERS ----------
-
+# -------------------------
+# HANDLERS
+# -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Напишите параметры камня, например:\nкрасный камень из Бирмы"
+        "Бот запущен. Напиши название камня."
     )
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.lower()
+    query = update.message.text.strip().lower()
 
     rows = sheet.get_all_records()
 
     for row in rows:
-        name = str(row.get("название камня", "")).lower()
-        color = str(row.get("цвет", "")).lower()
-        origin = str(row.get("происхождение", "")).lower()
-        image_url = row.get("image_url", "")
-
-        if (
-            (not name or name in query)
-            and (not color or color in query)
-            and (not origin or origin in query)
-        ):
-            text = (
-                f"Камень: {row.get('название камня')}\n"
+        name = str(row.get("название каменя", "")).lower()
+        if name == query:
+            reply = (
+                f"Название: {row.get('название каменя')}\n"
                 f"Цвет: {row.get('цвет')}\n"
                 f"Размер: {row.get('размер')}\n"
                 f"Происхождение: {row.get('происхождение')}\n"
@@ -72,27 +78,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Стоимость: {row.get('стоимость')}"
             )
 
+            image_url = row.get("картинка")
+
             if image_url:
-                await update.message.reply_photo(photo=image_url, caption=text)
+                await update.message.reply_photo(photo=image_url, caption=reply)
             else:
-                await update.message.reply_text(text)
+                await update.message.reply_text(reply)
 
             return
 
-    await update.message.reply_text("Подходящих камней не найдено.")
+    await update.message.reply_text("Камень не найден.")
 
-
-# ---------- APP ----------
-
+# -------------------------
+# MAIN
+# -------------------------
 def main():
+    logging.info("BOT STARTING")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
+    logging.info("BOT POLLING")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
-
