@@ -1,104 +1,98 @@
 import os
-import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import json
 
 import gspread
 from google.oauth2.service_account import Credentials
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-import openai
 
-# ---------- НАСТРОЙКИ ----------
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-openai.api_key = OPENAI_API_KEY
-
-SHEET_NAME = "Gemstones"
+# ---------- CONFIG ----------
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-creds = Credentials.from_service_account_file(
-    "service_account.json",
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # может не использоваться
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN is not set")
+
+if not SPREADSHEET_ID:
+    raise ValueError("SPREADSHEET_ID is not set")
+
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+
+
+# ---------- GOOGLE SHEETS ----------
+
+service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+creds = Credentials.from_service_account_info(
+    service_account_info,
     scopes=SCOPES
 )
 
 gc = gspread.authorize(creds)
-sheet = gc.open(SHEET_NAME).sheet1
+sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
-# ---------- ЛОГИ ----------
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-# ---------- КОМАНДЫ ----------
+# ---------- TELEGRAM HANDLERS ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Напиши запрос, например:\n"
-        "• красный камень\n"
-        "• зелёный для подарка\n"
-        "• прозрачный дорогой"
+        "Напишите параметры камня, например:\nкрасный камень из Бирмы"
     )
 
-# ---------- ОСНОВНАЯ ЛОГИКА ----------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
+    query = update.message.text.lower()
 
     rows = sheet.get_all_records()
 
-    matched = None
     for row in rows:
-        if row["цвет"].lower() in user_text:
-            matched = row
-            break
+        name = str(row.get("название камня", "")).lower()
+        color = str(row.get("цвет", "")).lower()
+        origin = str(row.get("происхождение", "")).lower()
+        image_url = row.get("image_url", "")
 
-    if not matched:
-        await update.message.reply_text("Подходящий камень не найден.")
-        return
+        if (
+            (not name or name in query)
+            and (not color or color in query)
+            and (not origin or origin in query)
+        ):
+            text = (
+                f"Камень: {row.get('название камня')}\n"
+                f"Цвет: {row.get('цвет')}\n"
+                f"Размер: {row.get('размер')}\n"
+                f"Происхождение: {row.get('происхождение')}\n"
+                f"Чистота: {row.get('чистота')}\n"
+                f"Стоимость: {row.get('стоимость')}"
+            )
 
-    prompt = f"""
-Опиши камень для клиента красиво и кратко.
+            if image_url:
+                await update.message.reply_photo(photo=image_url, caption=text)
+            else:
+                await update.message.reply_text(text)
 
-Название: {matched['название']}
-Цвет: {matched['цвет']}
-Размер: {matched['размер']}
-Происхождение: {matched['происхождение']}
-Чистота: {matched['чистота']}
-Стоимость: {matched['стоимость']}
-"""
+            return
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Ты ювелирный консультант."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
+    await update.message.reply_text("Подходящих камней не найдено.")
 
-    description = response.choices[0].message.content
 
-    image_url = matched["image_url"]
-
-    await update.message.reply_photo(
-        photo=image_url,
-        caption=description
-    )
-
-# ---------- ЗАПУСК ----------
+# ---------- APP ----------
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling()
 
+
 if __name__ == "__main__":
     main()
+
