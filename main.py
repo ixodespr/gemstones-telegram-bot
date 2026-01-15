@@ -39,7 +39,7 @@ if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
 
 # -------------------------
-# GOOGLE SHEETS SETUP
+# GOOGLE SHEETS
 # -------------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
@@ -58,7 +58,12 @@ sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот запущен. Напиши название камня."
+        "Привет.\n\n"
+        "Как пользоваться ботом:\n"
+        "1. Напиши название камня.\n"
+        "2. Название должно совпадать с таблицей.\n"
+        "3. Бот пришлёт описание и фото.\n\n"
+        "Просто текст. Всё."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
