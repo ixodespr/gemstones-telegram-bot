@@ -54,6 +54,19 @@ gc = gspread.authorize(credentials)
 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
 # -------------------------
+# HELPERS
+# -------------------------
+def normalize(text: str) -> str:
+    if not text:
+        return ""
+    return (
+        str(text)
+        .strip()
+        .lower()
+        .replace("\u00a0", " ")
+    )
+
+# -------------------------
 # HANDLERS
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -61,20 +74,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет.\n\n"
         "Как пользоваться ботом:\n"
         "1. Напиши название камня.\n"
-        "2. Название должно совпадать с таблицей.\n"
-        "3. Бот пришлёт описание и фото.\n\n"
-        "Просто текст. Всё."
+        "2. Можно вводить частично.\n"
+        "3. Бот пришлёт описание и фото.\n"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip().lower()
+    query = normalize(update.message.text)
+
+    if not query:
+        await update.message.reply_text("Напиши название камня.")
+        return
 
     rows = sheet.get_all_records()
 
     for row in rows:
-        stone_name = str(row.get("название каменя", "")).strip().lower()
+        stone_name = normalize(row.get("название каменя"))
 
-        if stone_name == query:
+        if query in stone_name:
             reply_text = (
                 f"Название: {row.get('название каменя')}\n"
                 f"Цвет: {row.get('цвет')}\n"
