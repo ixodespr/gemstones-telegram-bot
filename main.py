@@ -1,9 +1,11 @@
 import os
 import json
 import logging
+from typing import List, Dict
 
 import gspread
 from google.oauth2.service_account import Credentials
+import google.generativeai as genai
 
 from telegram import Update
 from telegram.ext import (
@@ -23,40 +25,131 @@ logging.basicConfig(
 )
 
 # -------------------------
-# ENV ПЕРЕМЕННЫЕ (КАК БЫЛО)
+# ENV
 # -------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN not set")
+if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON, GEMINI_API_KEY]):
+    raise RuntimeError("Missing ENV variables")
 
-if not SPREADSHEET_ID:
-    raise RuntimeError("SPREADSHEET_ID not set")
+# -------------------------
+# GEMINI CONFIG
+# -------------------------
+genai.configure(api_key=GEMINI_API_KEY)
 
-if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+gemini_model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash"
+)
+
+def gemini_call(prompt: str) -> str | None:
+    try:
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 300,
+            },
+            request_options={"timeout": 8},
+        )
+        return response.text
+    except Exception as e:
+        logging.warning(f"Gemini failed: {e}")
+        return None
 
 # -------------------------
 # GOOGLE SHEETS
 # -------------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-
 creds = Credentials.from_service_account_info(
-    service_account_info,
+    json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
     scopes=SCOPES,
 )
 
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
+ROWS_CACHE: List[Dict] = sheet.get_all_records()
 
+# -------------------------
+# UTILS
+# -------------------------
 def normalize(text: str) -> str:
     return text.strip().lower()
 
+# -------------------------
+# AI LOGIC
+# -------------------------
+def parse_intent(user_text: str) -> Dict:
+    prompt = f"""
+Ты аналитический модуль каталога камней.
+Верни ТОЛЬКО JSON строго по схеме:
+
+{{
+  "stone": string|null,
+  "color": string|null,
+  "budget_max": number|null,
+  "intent": "buy"|"compare"|"ask"
+}}
+
+Запрос пользователя:
+{user_text}
+"""
+    raw = gemini_call(prompt)
+    if not raw:
+        return {}
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+def filter_rows(intent: Dict) -> List[Dict]:
+    results = []
+
+    for row in ROWS_CACHE:
+        if intent.get("stone"):
+            if intent["stone"] not in normalize(str(row.get("name", ""))):
+                continue
+
+        if intent.get("color"):
+            if intent["color"] not in normalize(str(row.get("color", ""))):
+                continue
+
+        if intent.get("budget_max"):
+            try:
+                if float(row.get("price", 0)) > intent["budget_max"]:
+                    continue
+            except ValueError:
+                continue
+
+        results.append(row)
+
+    return results
+
+def build_sales_reply(intent: Dict, rows: List[Dict]) -> str:
+    if not rows:
+        return "Подходящих вариантов не нашёл. Можем расширить критерии."
+
+    top = rows[:3]
+
+    prompt = f"""
+Пользователь хочет: {intent}
+
+Вот подходящие варианты:
+{json.dumps(top, ensure_ascii=False)}
+
+Сформулируй короткий продающий ответ:
+- без воды
+- максимум 5 строк
+- акцент на выгоду
+"""
+
+    text = gemini_call(prompt)
+    return text or "Нашёл несколько подходящих вариантов. Могу показать детали."
 
 # -------------------------
 # HANDLERS
@@ -64,44 +157,20 @@ def normalize(text: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Я бот каталога камней.\n"
-        "Напиши название камня, например:\n"
-        "Pink Spinel"
+        "Опиши, что ты ищешь:\n"
+        "например: pink spinel до 3000"
     )
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = normalize(update.message.text)
+    user_text = update.message.text
 
-    rows = sheet.get_all_records()
+    await update.message.reply_text("Подбираю варианты…")
 
-    for row in rows:
-        name = normalize(str(row.get("name", "")))
+    intent = parse_intent(user_text)
+    rows = filter_rows(intent)
 
-        if name == query:
-            reply = (
-                f"Название: {row.get('name')}\n"
-                f"Цвет: {row.get('color')}\n"
-                f"Форма: {row.get('shape')}\n"
-                f"Размер: {row.get('size ct')} ct\n"
-                f"Происхождение: {row.get('origin')}\n"
-                f"Чистота: {row.get('clarity')}\n"
-                f"Цена: {row.get('price')}"
-            )
-
-            image_url = row.get("image_url")
-
-            if image_url:
-                await update.message.reply_photo(
-                    photo=image_url,
-                    caption=reply
-                )
-            else:
-                await update.message.reply_text(reply)
-
-            return
-
-    await update.message.reply_text("Камень не найден.")
-
+    reply = build_sales_reply(intent, rows)
+    await update.message.reply_text(reply)
 
 # -------------------------
 # MAIN
@@ -118,7 +187,6 @@ def main():
 
     logging.info("BOT POLLING")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
