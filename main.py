@@ -1,11 +1,11 @@
 import os
 import json
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
-import google.generativeai as genai
+from google import genai
 
 from telegram import Update
 from telegram.ext import (
@@ -16,52 +16,50 @@ from telegram.ext import (
     filters,
 )
 
-# -------------------------
-# ЛОГИ
-# -------------------------
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# -------------------------
+# =========================
 # ENV
-# -------------------------
+# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON, GEMINI_API_KEY]):
-    raise RuntimeError("Missing ENV variables")
+    raise RuntimeError("Missing required ENV variables")
 
-# -------------------------
-# GEMINI CONFIG
-# -------------------------
-genai.configure(api_key=GEMINI_API_KEY)
+# =========================
+# GEMINI (NEW SDK)
+# =========================
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-gemini_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash"
-)
-
-def gemini_call(prompt: str) -> str | None:
+def gemini_call(prompt: str) -> Optional[str]:
     try:
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config={
+        response = gemini_client.models.generate_content(
+            model="models/gemini-1.5-flash",
+            contents=prompt,
+            config={
                 "temperature": 0.2,
                 "max_output_tokens": 300,
             },
-            request_options={"timeout": 8},
         )
-        return response.text
+        if not response.text:
+            return None
+        return response.text.strip()
     except Exception as e:
         logging.warning(f"Gemini failed: {e}")
         return None
 
-# -------------------------
+# =========================
 # GOOGLE SHEETS
-# -------------------------
+# =========================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 creds = Credentials.from_service_account_info(
@@ -73,20 +71,27 @@ gc = gspread.authorize(creds)
 sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
 ROWS_CACHE: List[Dict] = sheet.get_all_records()
+logging.info(f"Loaded {len(ROWS_CACHE)} rows from sheet")
 
-# -------------------------
+# =========================
 # UTILS
-# -------------------------
+# =========================
 def normalize(text: str) -> str:
     return text.strip().lower()
 
-# -------------------------
+def safe_float(value) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+# =========================
 # AI LOGIC
-# -------------------------
+# =========================
 def parse_intent(user_text: str) -> Dict:
     prompt = f"""
-Ты аналитический модуль каталога камней.
-Верни ТОЛЬКО JSON строго по схеме:
+Ты аналитический модуль каталога драгоценных камней.
+Верни ТОЛЬКО валидный JSON строго по схеме:
 
 {{
   "stone": string|null,
@@ -105,6 +110,7 @@ def parse_intent(user_text: str) -> Dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        logging.warning(f"Invalid JSON from Gemini: {raw}")
         return {}
 
 def filter_rows(intent: Dict) -> List[Dict]:
@@ -120,10 +126,8 @@ def filter_rows(intent: Dict) -> List[Dict]:
                 continue
 
         if intent.get("budget_max"):
-            try:
-                if float(row.get("price", 0)) > intent["budget_max"]:
-                    continue
-            except ValueError:
+            price = safe_float(row.get("price"))
+            if price <= 0 or price > intent["budget_max"]:
                 continue
 
         results.append(row)
@@ -132,33 +136,47 @@ def filter_rows(intent: Dict) -> List[Dict]:
 
 def build_sales_reply(intent: Dict, rows: List[Dict]) -> str:
     if not rows:
-        return "Подходящих вариантов не нашёл. Можем расширить критерии."
+        return "Подходящих вариантов не нашёл. Можно расширить критерии или увеличить бюджет."
 
-    top = rows[:3]
+    top = sorted(
+        rows,
+        key=lambda r: safe_float(r.get("price")),
+    )[:3]
 
     prompt = f"""
-Пользователь хочет: {intent}
+Пользователь ищет камень с параметрами:
+{json.dumps(intent, ensure_ascii=False)}
 
-Вот подходящие варианты:
+Подходящие варианты (JSON):
 {json.dumps(top, ensure_ascii=False)}
 
 Сформулируй короткий продающий ответ:
+- 3–5 строк
 - без воды
-- максимум 5 строк
-- акцент на выгоду
+- подчеркни ценность и отличие
 """
 
     text = gemini_call(prompt)
-    return text or "Нашёл несколько подходящих вариантов. Могу показать детали."
+    if text:
+        return text
 
-# -------------------------
+    # fallback без ИИ
+    lines = []
+    for r in top:
+        lines.append(
+            f"{r.get('name')} | {r.get('color')} | {r.get('size ct')} ct | ${r.get('price')}"
+        )
+
+    return "Нашёл подходящие варианты:\n" + "\n".join(lines)
+
+# =========================
 # HANDLERS
-# -------------------------
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Я бот каталога камней.\n"
-        "Опиши, что ты ищешь:\n"
-        "например: pink spinel до 3000"
+        "Опиши, что ты ищешь.\n"
+        "Например: pink spinel до 3000"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,14 +185,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Подбираю варианты…")
 
     intent = parse_intent(user_text)
+    logging.info(f"INTENT: {intent}")
+
     rows = filter_rows(intent)
+    logging.info(f"FOUND ROWS: {len(rows)}")
 
     reply = build_sales_reply(intent, rows)
     await update.message.reply_text(reply)
 
-# -------------------------
+# =========================
 # MAIN
-# -------------------------
+# =========================
 def main():
     logging.info("BOT STARTING")
 
